@@ -8,11 +8,14 @@ import java.io.{File, PrintWriter}
 // import com.hari.spark.Utils._
 
 object Lab17_NLPPipeline {
+
   def main(args: Array[String]): Unit = {
     val spark = SparkSession.builder
       .appName("NLP Pipeline Example")
       .master("local[*]")
       .getOrCreate()
+
+spark.sparkContext.setLogLevel("ERROR")
 
     import spark.implicits._
     println("Spark Session created successfully.")
@@ -101,8 +104,19 @@ object Lab17_NLPPipeline {
 	  .setVectorSize(100)
 	  .setMinCount(0)
 
-	val pipeline = new Pipeline()
-	  .setStages(Array(tokenizer, stopWordsRemover, word2Vec))
+//	val pipeline = new Pipeline().setStages(Array(tokenizer, stopWordsRemover, word2Vec))
+
+
+//Normalizer
+
+	import org.apache.spark.ml.feature.Normalizer
+
+	val normalizer = new Normalizer()
+	  .setInputCol("features")
+	  .setOutputCol("norm_features")
+	  .setP(2.0)  // L2 norm
+
+	val pipeline = new Pipeline().setStages(Array(tokenizer, stopWordsRemover, word2Vec, normalizer))
 
 
     // 6. --- Assemble the Pipeline ---
@@ -187,15 +201,17 @@ object Lab17_NLPPipeline {
     import org.apache.spark.ml.classification.LogisticRegression
     import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 
-    val labeledDF = initialDF.withColumn("label", when(col("text").rlike("(?i)spark"), 1.0).otherwise(0.0))
-    val Array(train, test) = labeledDF.randomSplit(Array(0.8, 0.2), seed = 1234L)
+	val labeledDF = initialDF.withColumn("label", when(col("text").rlike("(?i)spark"), 1.0).otherwise(0.0))
+	val Array(train, test) = labeledDF.randomSplit(Array(0.8, 0.2), seed = 1234L)
 
-    val lr = new LogisticRegression()
-      .setLabelCol("label")
-      .setFeaturesCol("features")
-      .setMaxIter(10)
+	val lr = new LogisticRegression()
+	  .setLabelCol("label")
+	  .setFeaturesCol("norm_features")
+	  .setMaxIter(10)
 
-    val pipelineLR = new Pipeline().setStages(Array(tokenizer, stopWordsRemover, word2Vec, lr))
+	val pipelineLR = new Pipeline().setStages(Array(tokenizer, stopWordsRemover, word2Vec, normalizer, lr))
+
+
     val modelLR = pipelineLR.fit(train)
     val predictions = modelLR.transform(test)
     val evaluator = new MulticlassClassificationEvaluator()
@@ -205,7 +221,35 @@ object Lab17_NLPPipeline {
 
     println(s"--> Logistic Regression Accuracy = ${evaluator.evaluate(predictions)}")
 
+  //COSINE SIMILARITY
+    import org.apache.spark.ml.linalg.Vector
+    import org.apache.spark.sql.Row
 
+    // Hàm cosine similarity
+    def cosineSimilarity(v1: Vector, v2: Vector): Double = {
+      val dot = v1.toArray.zip(v2.toArray).map { case (x, y) => x * y }.sum
+      val norm1 = math.sqrt(v1.toArray.map(x => x*x).sum)
+      val norm2 = math.sqrt(v2.toArray.map(x => x*x).sum)
+      if (norm1 == 0.0 || norm2 == 0.0) 0.0 else dot / (norm1 * norm2)
+    }
+
+    val queryRow: Row = transformedDF.select("norm_features", "text").collect()(0)
+    val queryVec = queryRow.getAs[Vector]("norm_features")
+    val queryText = queryRow.getAs[String]("text")
+
+    println("\n================ QUERY DOCUMENT ================")
+    println(queryText.take(200) + "...")
+    println("================================================")
+
+    val cosineUDF = udf((vec: Vector) => cosineSimilarity(queryVec, vec))
+
+    val sims = transformedDF.withColumn("similarity", cosineUDF(col("norm_features")))
+
+    println("\n================ TOP 10 SIMILAR DOCUMENTS ================")
+    sims.orderBy(desc("similarity"))
+      .select("similarity", "text")
+      .show(10, truncate = 120)
+    println("==========================================================")
 
     spark.stop()
     println("Spark Session stopped.")
